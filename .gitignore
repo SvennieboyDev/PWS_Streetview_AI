@@ -1,0 +1,11 @@
+# Geheimen: nooit uploaden
+token.txt
+
+# Python-omgeving
+.venv/
+__pycache__/
+
+# Te groot voor GitHub (staat lokaal)
+trainset/
+embeddings/
+*.tmp
