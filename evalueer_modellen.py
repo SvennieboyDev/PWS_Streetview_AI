@@ -404,7 +404,7 @@ def grafiek_cumulatief(regels, pad):
         ys = [100 * sum(f <= x for f in fouten) / len(fouten) for x in xs]
         if r["methode"] in KLEUREN:
             ax.plot(xs, ys, color=KLEUREN[r["methode"]], lw=2, label=r["methode"])
-        else:
+        elif r["methode"] in BASELINE_STIJL:
             kleur, streep = BASELINE_STIJL[r["methode"]]
             ax.plot(xs, ys, color=kleur, lw=1.6, linestyle=streep, label=r["methode"])
 
@@ -439,9 +439,14 @@ def kaart_fouten(fotos, methoden, regels, provincies, pad):
     oost = max(p["rechthoek"][2] for p in provincies) + 0.1
     noord = max(p["rechthoek"][3] for p in provincies) + 0.1
 
-    fig, assen = plt.subplots(1, len(modellen), figsize=(5.2 * len(modellen), 6.6),
+    # 1-3 kaarten naast elkaar, 4 als 2x2, meer in rijen van 3
+    kolommen = len(modellen) if len(modellen) <= 3 else (2 if len(modellen) == 4 else 3)
+    rijen = math.ceil(len(modellen) / kolommen)
+    fig, assen = plt.subplots(rijen, kolommen, figsize=(5.2 * kolommen, 6.3 * rijen + 0.9),
                               dpi=150, facecolor=OPPERVLAK, squeeze=False)
-    for ax, naam in zip(assen[0], modellen):
+    for ax in assen.flat[len(modellen):]:
+        ax.set_visible(False)  # lege plekken in het raster
+    for ax, naam in zip(assen.flat, modellen):
         ax.set_facecolor(OPPERVLAK)
         for prov in provincies:
             for poly in prov["polygonen"]:
@@ -477,17 +482,20 @@ def kaart_fouten(fotos, methoden, regels, provincies, pad):
 
     # Eén uitleg en één legenda voor de hele figuur
     from matplotlib.lines import Line2D
+    kop = 0.9 / (6.3 * rijen + 0.9)  # deel van de hoogte voor titel, uitleg en legenda
     fig.suptitle("Waar legt elk model de testfoto's neer?", x=0.01, ha="left",
                  color=TEKST, fontsize=14, fontweight="bold", y=1.0)
-    fig.text(0.01, 0.955, "Elk lijntje loopt van de echte plek van een foto (grijze stip) "
-             "naar de plek die het model voorspelde (gekleurde stip). "
+    fig.text(0.01, 1 - kop * 0.5, "Elk lijntje loopt van de echte plek van een foto "
+             "(grijze stip) naar de plek die het model voorspelde (gekleurde stip). "
              "Korte lijntjes = goed.", ha="left", va="top", color=TEKST_2, fontsize=10)
     fig.legend(handles=[
         Line2D([], [], marker="o", ls="", color=TEKST_2, markersize=4, label="echte plek"),
         Line2D([], [], marker="o", ls="", color="#8a8983", markersize=5,
                label="voorspelling (kleur van het model)"),
-    ], loc="upper right", frameon=False, fontsize=9, ncol=2, bbox_to_anchor=(0.99, 0.965))
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    ], loc="upper left", frameon=False, fontsize=9, ncol=2,
+        bbox_to_anchor=(0.003, 1 - kop * 0.78))
+    # h_pad: ruimte tussen de rijen, zodat titels niet over de kaart erboven vallen
+    fig.tight_layout(rect=(0, 0, 1, 1 - kop * 1.4), h_pad=5)
     # bbox_inches="tight" zorgt dat er nooit tekst van de rand valt
     fig.savefig(pad, facecolor=OPPERVLAK, bbox_inches="tight", pad_inches=0.25)
     plt.close(fig)

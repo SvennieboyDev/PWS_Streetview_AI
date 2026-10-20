@@ -12,6 +12,13 @@ Opzet ("transfer learning"):
            "gewogen"     = gemiddelde van alle vakjes, gewogen naar kans
        - kNN: zoekt de k trainingsfoto's die het meest op de testfoto lijken
          en voorspelt het gemiddelde van hun locaties.
+       - Slim model (trucs uit het PIGEON-artikel):
+           * vakjes die de data volgen: k-means verdeelt de trainingsfoto's in
+             groepjes, dus kleine vakjes waar veel foto's zijn;
+           * haversine label smoothing: een buurvakje telt deels goed, hoe
+             dichterbij hoe meer (tau bepaalt hoe snel dat afneemt);
+           * verfijning: binnen de 5 meest waarschijnlijke vakjes zoeken naar
+             de trainingsfoto's die het meest op de testfoto lijken.
   3. De instellingen (vakgrootte, C, k) worden gekozen met een validatieset
      die uit de TRAININGSDATA komt. De testset wordt pas helemaal aan het
      eind één keer gebruikt, zodat de testscore eerlijk blijft.
@@ -33,7 +40,16 @@ Benodigd:
   pip install scikit-learn   (plus wat al in requirements.txt staat)
 
 Gebruik (in de projectmap, na mapillary_trainset.py):
-  python train_eigen_model.py
+  python train_eigen_model.py                    # met StreetCLIP
+  python train_eigen_model.py --encoder dinov3   # met DINOv3 (Meta, 2025)
+  python train_eigen_model.py --encoder dinov2   # met DINOv2 (Meta, 2023)
+Elke encoder krijgt eigen vingerafdrukken en een eigen resultatenmap
+(resultaten_eigen/, resultaten_eigen_dinov3/, ...), zodat je ze kunt vergelijken.
+
+DINOv3 is "gated": log eenmalig in op huggingface.co, ga naar
+https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m, accepteer de
+voorwaarden en zet je Hugging Face-token in de terminal: set HF_TOKEN=hf_...
+DINOv2 werkt zonder toestemming.
 
 Stap 1 is het zware deel: zonder grafische kaart ongeveer 0,5-1 seconde per
 foto. De vingerafdrukken worden opgeslagen in de map 'embeddings/', dus dat
@@ -62,13 +78,24 @@ from mapillary_testset import laad_provincies
 TRAIN_CSV = Path("trainset/trainset.csv")
 TRAIN_MAP = Path("trainset")
 EMB_MAP = Path("embeddings")
-UIT = Path("resultaten_eigen")
-ENCODER = "geolocal/StreetCLIP"
+UIT = Path("resultaten_eigen")         # wordt per encoder aangepast in main()
+ENCODERS = {
+    "streetclip": {"hf": "geolocal/StreetCLIP", "soort": "clip", "naam": "StreetCLIP"},
+    "dinov3": {"hf": "facebook/dinov3-vitl16-pretrain-lvd1689m", "soort": "dino",
+               "naam": "DINOv3"},
+    "dinov2": {"hf": "facebook/dinov2-large", "soort": "dino", "naam": "DINOv2"},
+}
 BATCH = 16
 
 VAK_GROOTTES_KM = [10, 20, 40, 60, 80]  # te proberen vakgroottes
 C_WAARDEN = [1.0, 10.0, 100.0]          # te proberen regularisatie (hoger = minder streng)
 K_WAARDEN = [1, 5, 10, 25, 50]      # te proberen k voor kNN
+SLIM_CELLEN = [25, 50, 100, 200]    # aantal k-means-vakjes voor het slimme model
+SLIM_TAU_KM = [10, 25, 50]          # label smoothing: hoe ver een buurvakje nog meetelt
+SLIM_WD = [1e-4, 1e-2]              # weight decay (regularisatie) van het slimme model
+SLIM_EPOCHS = 300
+VERFIJN_TOP = 5                     # in zoveel waarschijnlijkste vakjes verfijnen
+VERFIJN_K = [1, 5, 10]              # met zoveel meest gelijkende trainingsfoto's
 VALIDATIE_DEEL = 0.2
 SEED = 0
 LEERCURVE_AANTALLEN = [500, 1000, 2000, 3000]  # + altijd het maximum
@@ -84,26 +111,36 @@ def lees_csv(pad, foto_map):
                 for r in csv.DictReader(f) if (foto_map / r["bestand"]).exists()]
 
 
-def laad_encoder():
-    from transformers import CLIPModel, CLIPProcessor
-    model = CLIPModel.from_pretrained(ENCODER)
-    processor = CLIPProcessor.from_pretrained(ENCODER)
-    return model, processor
+def laad_encoder(sleutel):
+    info = ENCODERS[sleutel]
+    try:
+        if info["soort"] == "clip":
+            from transformers import CLIPModel, CLIPProcessor
+            return CLIPModel.from_pretrained(info["hf"]), CLIPProcessor.from_pretrained(info["hf"])
+        from transformers import AutoImageProcessor, AutoModel
+        return AutoModel.from_pretrained(info["hf"]), AutoImageProcessor.from_pretrained(info["hf"])
+    except OSError as fout:
+        raise SystemExit(
+            f"{info['naam']} kon niet worden geladen: {fout}\n"
+            "Bij DINOv3: accepteer eerst de voorwaarden op de Hugging Face-pagina en "
+            "zet je token met: set HF_TOKEN=hf_...  (of gebruik --encoder dinov2)")
 
 
 class Encoder:
-    """Laadt StreetCLIP pas als er echt iets te berekenen valt."""
+    """Laadt het model pas als er echt iets te berekenen valt."""
 
-    def __init__(self):
+    def __init__(self, sleutel="streetclip"):
+        self.sleutel = sleutel
+        self.soort = ENCODERS[sleutel]["soort"]
         self.model = None
 
     def __call__(self, afbeeldingen):
         import torch
         import torch.nn.functional as F
         if self.model is None:
-            print("StreetCLIP laden...")
+            print(f"{ENCODERS[self.sleutel]['naam']} laden...")
             self.apparaat = ev.kies_apparaat()
-            self.model, self.processor = laad_encoder()
+            self.model, self.processor = laad_encoder(self.sleutel)
             self.model = self.model.to(self.apparaat).eval()
             if self.apparaat == "cuda":
                 self.model = self.model.half()
@@ -112,7 +149,10 @@ class Encoder:
         if self.apparaat == "cuda":
             x = x.half()
         with torch.no_grad():
-            v = ev.als_tensor(self.model.get_image_features(pixel_values=x))
+            if self.soort == "clip":
+                v = ev.als_tensor(self.model.get_image_features(pixel_values=x))
+            else:  # DINO: de samenvatting van de hele foto (CLS-token)
+                v = self.model(pixel_values=x).pooler_output
         return F.normalize(v.float(), dim=1).cpu().numpy().astype(np.float32)
 
 
@@ -136,7 +176,7 @@ def vingerafdrukken(naam, fotos, foto_map, encoder):
         with open(tijdelijk, "wb") as f:
             np.savez(f, bestanden=np.array(namen),
                      vectoren=np.stack([klaar[n] for n in namen]) if namen
-                     else np.zeros((0, 768), np.float32))
+                     else np.zeros((0, 1), np.float32))
         os.replace(tijdelijk, pad)
 
     te_doen = [f["bestand"] for f in fotos if f["bestand"] not in klaar]
@@ -206,6 +246,70 @@ def knn_voorspel(X_train, lats, lons, X, k):
     return np.stack([lats[buren].mean(1), lons[buren].mean(1)], axis=1)
 
 
+def afstanden_km(lat1, lon1, lat2, lon2):
+    """Matrix met haversine-afstanden: rijen = punten 1, kolommen = punten 2."""
+    p1, p2 = np.radians(lat1)[:, None], np.radians(lat2)[None, :]
+    dl = np.radians(lon2)[None, :] - np.radians(lon1)[:, None]
+    a = np.sin((p2 - p1) / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+    return 2 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+
+class SlimModel:
+    """Vakjes die de data volgen (k-means) + haversine label smoothing,
+    getraind als één lineaire laag in PyTorch."""
+
+    def __init__(self, n_cellen, tau_km, wd):
+        self.n_cellen, self.tau_km, self.wd = n_cellen, tau_km, wd
+
+    def fit(self, X, lats, lons):
+        import torch
+        from sklearn.cluster import KMeans
+        n = min(self.n_cellen, len(X))
+        schaal = math.cos(math.radians(52.2))
+        km = KMeans(n_clusters=n, n_init=4, random_state=SEED).fit(
+            np.stack([lats, lons * schaal], axis=1))
+        self.cel = km.labels_
+        self.midden = np.array([[lats[self.cel == c].mean(), lons[self.cel == c].mean()]
+                                for c in range(n)])
+        # Doel per foto: kans per vakje, aflopend met de afstand tot dat vakje
+        d = afstanden_km(lats, lons, self.midden[:, 0], self.midden[:, 1])
+        doel = np.exp(-(d - d.min(axis=1, keepdims=True)) / self.tau_km)
+        doel /= doel.sum(axis=1, keepdims=True)
+
+        self.gem, self.sd = X.mean(0), X.std(0) + 1e-6
+        torch.manual_seed(SEED)
+        Xt = torch.tensor((X - self.gem) / self.sd, dtype=torch.float32)
+        Dt = torch.tensor(doel, dtype=torch.float32)
+        self.laag = torch.nn.Linear(X.shape[1], n)
+        opt = torch.optim.Adam(self.laag.parameters(), lr=5e-3, weight_decay=self.wd)
+        for _ in range(SLIM_EPOCHS):
+            opt.zero_grad()
+            verlies = -(Dt * torch.log_softmax(self.laag(Xt), dim=1)).sum(1).mean()
+            verlies.backward()
+            opt.step()
+        return self
+
+    def voorspel(self, X):
+        import torch
+        with torch.no_grad():
+            kans = torch.softmax(self.laag(torch.tensor((X - self.gem) / self.sd,
+                                                         dtype=torch.float32)), 1).numpy()
+        return self.midden[kans.argmax(1)], kans
+
+
+def verfijn(kans, model, X_train, lats, lons, X, k, top=VERFIJN_TOP):
+    """Zoekt binnen de 'top' waarschijnlijkste vakjes de k trainingsfoto's die
+    het meest op de foto lijken en neemt het gemiddelde van hun plekken."""
+    uit = np.zeros((len(X), 2))
+    beste_cellen = np.argsort(-kans, axis=1)[:, :top]
+    for i in range(len(X)):
+        kandidaten = np.flatnonzero(np.isin(model.cel, beste_cellen[i]))
+        gelijkenis = X_train[kandidaten] @ X[i]
+        kies = kandidaten[np.argsort(-gelijkenis)[:k]]
+        uit[i] = lats[kies].mean(), lons[kies].mean()
+    return uit
+
+
 def mediane_fout(pred, lats, lons):
     return statistics.median(ev.afstand_km(a, b, p[0], p[1])
                              for a, b, p in zip(lats, lons, pred))
@@ -246,12 +350,31 @@ def kies_instellingen(X, lats, lons, train):
         rijen.append(rij)
         print(f"  kNN k={k:<3} -> mediaan {rij['val_mediaan_beste_km']} km")
 
+    for n in SLIM_CELLEN:
+        for tau in SLIM_TAU_KM:
+            for wd in SLIM_WD:
+                m = SlimModel(n, tau, wd).fit(X[tr], lats[tr], lons[tr])
+                pred, kans = m.voorspel(X[va])
+                rij = {"methode": "slim", "cellen": n, "tau_km": tau, "wd": wd,
+                       "val_mediaan_beste_km": round(mediane_fout(pred, lats[va], lons[va]), 1)}
+                for k in VERFIJN_K:
+                    ver = verfijn(kans, m, X[tr], lats[tr], lons[tr], X[va], k)
+                    rij[f"val_mediaan_verfijnd_k{k}_km"] = round(mediane_fout(ver, lats[va], lons[va]), 1)
+                rijen.append(rij)
+                print(f"  slim {n:>3} cellen, tau={tau:>2} km, wd={wd:g} -> mediaan "
+                      f"{rij['val_mediaan_beste_km']} km (verfijnd: " +
+                      ", ".join(f"k={k} {rij[f'val_mediaan_verfijnd_k{k}_km']}" for k in VERFIJN_K) + ")")
+
     vakjes = [r for r in rijen if r["methode"] == "vakjes"]
     beste_vak = min(vakjes, key=lambda r: r["val_mediaan_beste_km"])
     beste_gew = min(vakjes, key=lambda r: r["val_mediaan_gewogen_km"])
     beste_knn = min((r for r in rijen if r["methode"] == "kNN"),
                     key=lambda r: r["val_mediaan_beste_km"])
-    return rijen, beste_vak, beste_gew, beste_knn
+    slim = [r for r in rijen if r["methode"] == "slim"]
+    beste_slim = min(slim, key=lambda r: r["val_mediaan_beste_km"])
+    beste_ver = min(((r, k) for r in slim for k in VERFIJN_K),
+                    key=lambda rk: rk[0][f"val_mediaan_verfijnd_k{rk[1]}_km"])
+    return rijen, beste_vak, beste_gew, beste_knn, beste_slim, beste_ver
 
 
 # ---------- Leercurve ----------
@@ -336,6 +459,15 @@ def grafiek_leercurve(rijen, baseline, pad):
     plt.close(fig)
 
 
+def schrijf_csv_alle_kolommen(pad, rijen):
+    """Zoals ev.schrijf_csv, maar met alle kolommen die in een van de rijen voorkomen."""
+    kolommen = list(dict.fromkeys(k for r in rijen for k in r))
+    with open(pad, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=kolommen)
+        w.writeheader()
+        w.writerows(rijen)
+
+
 # ---------- Stap 3: statistiek ----------
 
 def vergelijk_met_baseline(fotos, methoden, baseline):
@@ -369,9 +501,17 @@ def vergelijk_met_baseline(fotos, methoden, baseline):
 def main():
     parser = argparse.ArgumentParser(description="Eigen geolocatiemodel trainen en testen")
     parser.add_argument("--zonder-leercurve", action="store_true", help="leercurve overslaan")
+    parser.add_argument("--encoder", choices=list(ENCODERS), default="streetclip",
+                        help="welk voorgetraind model de vingerafdrukken maakt")
     args = parser.parse_args()
 
+    global UIT
+    # StreetCLIP houdt de oude bestandsnamen, zodat bestaande vingerafdrukken blijven werken
+    voorvoegsel = "" if args.encoder == "streetclip" else f"{args.encoder}_"
+    if args.encoder != "streetclip":
+        UIT = Path(f"resultaten_eigen_{args.encoder}")
     UIT.mkdir(exist_ok=True)
+    print(f"Encoder: {ENCODERS[args.encoder]['naam']} -> resultaten in '{UIT}/'")
     provincies = laad_provincies()
 
     if not TRAIN_CSV.exists():
@@ -383,17 +523,22 @@ def main():
         print("Let op: met minder dan ~1000 trainingsfoto's leert het model weinig.")
 
     # Stap 1
-    encoder = Encoder()
-    X_train, train = vingerafdrukken("train", train, TRAIN_MAP, encoder)
-    X_test, test = vingerafdrukken("test", test, ev.TESTSET_MAP, encoder)
+    encoder = Encoder(args.encoder)
+    X_train, train = vingerafdrukken(f"{voorvoegsel}train", train, TRAIN_MAP, encoder)
+    X_test, test = vingerafdrukken(f"{voorvoegsel}test", test, ev.TESTSET_MAP, encoder)
     lats = np.array([f["lat"] for f in train])
     lons = np.array([f["lon"] for f in train])
 
     # Stap 2
-    rijen, beste_vak, beste_gew, beste_knn = kies_instellingen(X_train, lats, lons, train)
-    ev.schrijf_csv(UIT / "instellingen.csv", rijen)
+    rijen, beste_vak, beste_gew, beste_knn, beste_slim, (beste_ver, ver_k) = \
+        kies_instellingen(X_train, lats, lons, train)
+    schrijf_csv_alle_kolommen(UIT / "instellingen.csv", rijen)
     print(f"\nGekozen: vakjes {beste_vak['vak_km']} km C={beste_vak['C']:g}; "
-          f"gewogen {beste_gew['vak_km']} km C={beste_gew['C']:g}; kNN k={beste_knn['k']}")
+          f"gewogen {beste_gew['vak_km']} km C={beste_gew['C']:g}; kNN k={beste_knn['k']}; "
+          f"slim {beste_slim['cellen']} vakjes tau={beste_slim['tau_km']} km; "
+          f"verfijning op {beste_ver['cellen']} vakjes tau={beste_ver['tau_km']} km, k={ver_k}")
+    naam_slim = f"Eigen: slim ({beste_slim['cellen']} vakjes)"
+    naam_ver = "Eigen: slim + verfijning"
 
     # Leercurve (op de validatieset, de testset blijft erbuiten)
     import matplotlib
@@ -401,7 +546,9 @@ def main():
     kleuren = {f"Eigen: vakjes {beste_vak['vak_km']} km": "#2a78d6",
                f"Eigen: gewogen {beste_gew['vak_km']} km": "#eb6834",
                f"Eigen: kNN k={beste_knn['k']}": "#1baf7a",
-               "StreetCLIP zonder training": "#eda100"}
+               "StreetCLIP zonder training": "#eda100",
+               naam_slim: "#e87ba4",
+               naam_ver: "#008300"}
     ev.KLEUREN.clear()
     ev.KLEUREN.update(kleuren)
     if not args.zonder_leercurve:
@@ -420,6 +567,16 @@ def main():
         m_gew = VakjesModel(beste_gew["vak_km"], beste_gew["C"]).fit(X_train, lats, lons)
     _, gewogen = m_gew.voorspel(X_test)
     knn = knn_voorspel(X_train, lats, lons, X_test, beste_knn["k"])
+    m_slim = SlimModel(beste_slim["cellen"], beste_slim["tau_km"], beste_slim["wd"]).fit(
+        X_train, lats, lons)
+    slim, _ = m_slim.voorspel(X_test)
+    if all(beste_ver[k] == beste_slim[k] for k in ("cellen", "tau_km", "wd")):
+        m_ver = m_slim
+    else:
+        m_ver = SlimModel(beste_ver["cellen"], beste_ver["tau_km"], beste_ver["wd"]).fit(
+            X_train, lats, lons)
+    _, kans = m_ver.voorspel(X_test)
+    verfijnd = verfijn(kans, m_ver, X_train, lats, lons, X_test, ver_k)
 
     def als_methode(pred):
         return [(float(a), float(b), ev.provincie_van(float(a), float(b), provincies), "")
@@ -431,7 +588,9 @@ def main():
         f"Eigen: kNN k={beste_knn['k']}": als_methode(knn),
     }
 
-    # Ter vergelijking: StreetCLIP zonder training (uit evalueer_modellen.py)
+    # Ter vergelijking: StreetCLIP zonder training (uit evalueer_modellen.py).
+    # Staat bewust vóór de slimme modellen: zo volgen de kleuren de volgorde
+    # van het palet en zijn ook voor kleurenblinden alle buren goed te onderscheiden.
     cache = ev.RESULTATEN / "cache_streetclip.json"
     if cache.exists():
         sc = json.loads(cache.read_text(encoding="utf-8"))
@@ -439,6 +598,8 @@ def main():
             methoden["StreetCLIP zonder training"] = [
                 (sc[f["bestand"]]["lat"], sc[f["bestand"]]["lon"],
                  sc[f["bestand"]]["provincie"], sc[f["bestand"]]["gemeente"]) for f in test]
+    methoden[naam_slim] = als_methode(slim)
+    methoden[naam_ver] = als_methode(verfijnd)
 
     # Dezelfde baselines als in evalueer_modellen.py
     mid_lat = statistics.mean(f["lat"] for f in test)
