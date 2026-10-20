@@ -425,7 +425,7 @@ def grafiek_cumulatief(regels, pad):
     for t in leg.get_texts():
         t.set_color(TEKST)
     fig.tight_layout()
-    fig.savefig(pad, facecolor=OPPERVLAK)
+    fig.savefig(pad, facecolor=OPPERVLAK, bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
 
 
@@ -439,7 +439,7 @@ def kaart_fouten(fotos, methoden, regels, provincies, pad):
     oost = max(p["rechthoek"][2] for p in provincies) + 0.1
     noord = max(p["rechthoek"][3] for p in provincies) + 0.1
 
-    fig, assen = plt.subplots(1, len(modellen), figsize=(5.2 * len(modellen), 6.2),
+    fig, assen = plt.subplots(1, len(modellen), figsize=(5.2 * len(modellen), 6.6),
                               dpi=150, facecolor=OPPERVLAK, squeeze=False)
     for ax, naam in zip(assen[0], modellen):
         ax.set_facecolor(OPPERVLAK)
@@ -453,11 +453,11 @@ def kaart_fouten(fotos, methoden, regels, provincies, pad):
             if not (west <= lon <= oost and zuid <= lat <= noord):
                 buiten += 1
             ax.plot([f["lon"], lon], [f["lat"], lat], color=KLEUREN[naam],
-                    lw=0.7, alpha=0.45, zorder=2)
+                    lw=0.6, alpha=0.35, zorder=2)
         ax.scatter([f["lon"] for f in fotos], [f["lat"] for f in fotos],
-                   s=8, color=TEKST_2, zorder=3, label="echte plek", linewidths=0)
+                   s=8, color=TEKST_2, zorder=3, linewidths=0)
         ax.scatter([v[1] for v in methoden[naam]], [v[0] for v in methoden[naam]],
-                   s=14, color=KLEUREN[naam], zorder=4, label="voorspelling",
+                   s=14, color=KLEUREN[naam], zorder=4,
                    edgecolors=OPPERVLAK, linewidths=0.6)
         ax.set_xlim(west, oost)
         ax.set_ylim(zuid, noord)
@@ -466,16 +466,30 @@ def kaart_fouten(fotos, methoden, regels, provincies, pad):
         ax.set_yticks([])
         for s in ax.spines.values():
             s.set_visible(False)
-        ax.set_title(f"{naam}\nmediane fout {mediaan[naam]} km", color=TEKST,
-                     fontsize=11, loc="left")
+        # Titel per kaart: modelnaam vet, daaronder de mediane fout
+        ax.text(0.0, 1.07, naam, transform=ax.transAxes, color=TEKST,
+                fontsize=12, fontweight="bold", va="bottom")
+        ax.text(0.0, 1.02, f"mediane fout {mediaan[naam]} km", transform=ax.transAxes,
+                color=TEKST_2, fontsize=10, va="bottom")
         if buiten:
-            ax.text(0.0, 0.0, f"{buiten} voorspelling(en) buiten beeld",
-                    transform=ax.transAxes, color=TEKST_2, fontsize=8)
-        leg = ax.legend(loc="upper left", frameon=False, fontsize=8)
-        for t in leg.get_texts():
-            t.set_color(TEKST)
-    fig.tight_layout()
-    fig.savefig(pad, facecolor=OPPERVLAK)
+            ax.text(0.0, -0.02, f"{buiten} voorspelling(en) buiten beeld",
+                    transform=ax.transAxes, color=TEKST_2, fontsize=8, va="top")
+
+    # Eén uitleg en één legenda voor de hele figuur
+    from matplotlib.lines import Line2D
+    fig.suptitle("Waar legt elk model de testfoto's neer?", x=0.01, ha="left",
+                 color=TEKST, fontsize=14, fontweight="bold", y=1.0)
+    fig.text(0.01, 0.955, "Elk lijntje loopt van de echte plek van een foto (grijze stip) "
+             "naar de plek die het model voorspelde (gekleurde stip). "
+             "Korte lijntjes = goed.", ha="left", va="top", color=TEKST_2, fontsize=10)
+    fig.legend(handles=[
+        Line2D([], [], marker="o", ls="", color=TEKST_2, markersize=4, label="echte plek"),
+        Line2D([], [], marker="o", ls="", color="#8a8983", markersize=5,
+               label="voorspelling (kleur van het model)"),
+    ], loc="upper right", frameon=False, fontsize=9, ncol=2, bbox_to_anchor=(0.99, 0.965))
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    # bbox_inches="tight" zorgt dat er nooit tekst van de rand valt
+    fig.savefig(pad, facecolor=OPPERVLAK, bbox_inches="tight", pad_inches=0.25)
     plt.close(fig)
 
 
